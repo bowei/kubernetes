@@ -20,8 +20,6 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
-
-	"github.com/golang/glog"
 )
 
 func newArg(t reflect.Type) *arg {
@@ -86,17 +84,54 @@ func (a *arg) String() string {
 
 // newMethod returns a newly initialized method.
 func newMethod(s *ServiceInfo, m reflect.Method) *Method {
-	ret := &Method{s, m, ""}
+	ret := &Method{
+		ServiceInfo: s,
+		m:           m,
+		kind:        MethodOperation,
+		ReturnType:  "",
+	}
 	ret.init()
 	return ret
 }
+
+// MethodKind is the type of method that we are generated code for.
+type MethodKind int
+
+const (
+	// MethodOperation is a long running method that returns an operation.
+	MethodOperation MethodKind = iota
+	// MethodGet is a method that immediately returns some data.
+	MethodGet MethodKind = iota
+	// MethodPaged is a method that returns a paged set of data.
+	MethodPaged MethodKind = iota
+)
 
 // Method is used to generate the calling code for non-standard methods.
 type Method struct {
 	*ServiceInfo
 	m reflect.Method
 
+	kind MethodKind
+	// ReturnType is the return type for the method.
 	ReturnType string
+	// ItemType is the type of the individual elements returns from a
+	// Pages() call. This is only applicable for MethodPaged kind.
+	ItemType string
+}
+
+// IsOperation is true if the method is an Operation.
+func (m *Method) IsOperation() bool {
+	return m.kind == MethodOperation
+}
+
+// IsPaged is true if the method paged.
+func (m *Method) IsPaged() bool {
+	return m.kind == MethodPaged
+}
+
+// IsGet is true if the method simple get.
+func (m *Method) IsGet() bool {
+	return m.kind == MethodGet
 }
 
 // argsSkip is the number of arguments to skip when generating the
@@ -135,7 +170,9 @@ func (mr *Method) args(skip int, nameArgs bool, prefix []string) []string {
 	return append(prefix, a...)
 }
 
-// init the method, preforming some rudimentary static checking.
+// init the method. This performs some rudimentary static checking as well as
+// determines the kind of method by looking at the shape (method signature) of
+// the object.
 func (mr *Method) init() {
 	fType := mr.m.Func.Type()
 	if fType.NumIn() < mr.argsSkip() {
@@ -162,21 +199,37 @@ func (mr *Method) init() {
 		panic(fmt.Errorf("method %q.%q: return type %q does not have a Do() method",
 			mr.Service, mr.Name(), returnTypeName))
 	}
+	_, hasPages := returnType.MethodByName("Pages")
 	// Do() method must return (*T, error).
 	switch doMethod.Func.Type().NumOut() {
 	case 2:
-		glog.Infof("Method %q.%q: return type %q of Do() = %v, %v",
-			mr.Service, mr.Name(), returnTypeName, doMethod.Func.Type().Out(0), doMethod.Func.Type().Out(1))
 		out0 := doMethod.Func.Type().Out(0)
 		if out0.Kind() != reflect.Ptr {
 			panic(fmt.Errorf("method %q.%q: return type %q of Do() = S, _; S must be pointer type (%v)",
 				mr.Service, mr.Name(), returnTypeName, out0))
 		}
 		mr.ReturnType = out0.Elem().Name()
-		if out0.Elem().Name() == "Operation" {
-			glog.Infof("Method %q.%q is an *Operation", mr.Service, mr.Name())
-		} else {
-			glog.Infof("Method %q.%q returns %v", mr.Service, mr.Name(), out0)
+		switch {
+		case out0.Elem().Name() == "Operation":
+			mr.kind = MethodOperation
+		case hasPages:
+			mr.kind = MethodPaged
+			// Pages() returns a xxxList that has the actual list
+			// of objects in the xxxList.Items field.
+			listType := out0.Elem()
+			itemsField, ok := listType.FieldByName("Items")
+			if !ok {
+				panic(fmt.Errorf("method %q.%q: paged return type %q does not have a .Items field", mr.Service, mr.Name(), listType.Name()))
+			}
+			// itemsField will be a []*ItemType. Dereference to
+			// extract the ItemType.
+			itemsType := itemsField.Type
+			if itemsType.Kind() != reflect.Slice && itemsType.Elem().Kind() != reflect.Ptr {
+				panic(fmt.Errorf("method %q.%q: paged return type %q.Items is not an array of pointers", mr.Service, mr.Name(), listType.Name()))
+			}
+			mr.ItemType = itemsType.Elem().Elem().Name()
+		default:
+			mr.kind = MethodGet
 		}
 		// Second argument must be "error".
 		if doMethod.Func.Type().Out(1).Name() != "error" {
@@ -219,32 +272,65 @@ func (mr *Method) MockHook() string {
 	args := mr.args(mr.argsSkip(), false, []string{
 		fmt.Sprintf("*%s", mr.MockWrapType()),
 		"context.Context",
-		"meta.Key",
+		"*meta.Key",
 	})
-	if mr.ReturnType == "Operation" {
-		return fmt.Sprintf("%v func(%v) error", mr.MockHookName(), strings.Join(args, ", "))
+	if mr.kind == MethodPaged {
+		args = append(args, "*filter.F")
 	}
-	return fmt.Sprintf("%v func(%v) (*%v.%v, error)", mr.MockHookName(), strings.Join(args, ", "), mr.Version(), mr.ReturnType)
+
+	switch mr.kind {
+	case MethodOperation:
+		return fmt.Sprintf("%v func(%v) error", mr.MockHookName(), strings.Join(args, ", "))
+	case MethodGet:
+		return fmt.Sprintf("%v func(%v) (*%v.%v, error)", mr.MockHookName(), strings.Join(args, ", "), mr.Version(), mr.ReturnType)
+	case MethodPaged:
+		return fmt.Sprintf("%v func(%v) ([]*%v.%v, error)", mr.MockHookName(), strings.Join(args, ", "), mr.Version(), mr.ItemType)
+	default:
+		panic(fmt.Errorf("invalid method kind: %v", mr.kind))
+	}
 }
 
 // FcnArgs is the function signature for the definition of the method.
 func (mr *Method) FcnArgs() string {
 	args := mr.args(mr.argsSkip(), true, []string{
 		"ctx context.Context",
-		"key meta.Key",
+		"key *meta.Key",
 	})
-
-	if mr.ReturnType == "Operation" {
-		return fmt.Sprintf("%v(%v) error", mr.m.Name, strings.Join(args, ", "))
+	if mr.kind == MethodPaged {
+		args = append(args, "fl *filter.F")
 	}
-	return fmt.Sprintf("%v(%v) (*%v.%v, error)", mr.m.Name, strings.Join(args, ", "), mr.Version(), mr.ReturnType)
+
+	switch mr.kind {
+	case MethodOperation:
+		return fmt.Sprintf("%v(%v) error", mr.m.Name, strings.Join(args, ", "))
+	case MethodGet:
+		return fmt.Sprintf("%v(%v) (*%v.%v, error)", mr.m.Name, strings.Join(args, ", "), mr.Version(), mr.ReturnType)
+	case MethodPaged:
+		return fmt.Sprintf("%v(%v) ([]*%v.%v, error)", mr.m.Name, strings.Join(args, ", "), mr.Version(), mr.ItemType)
+	default:
+		panic(fmt.Errorf("invalid method kind: %v", mr.kind))
+	}
 }
 
 // InterfaceFunc is the function declaration of the method in the interface.
 func (mr *Method) InterfaceFunc() string {
-	args := mr.args(mr.argsSkip(), false, []string{"context.Context", "meta.Key"})
-	if mr.ReturnType == "Operation" {
-		return fmt.Sprintf("%v(%v) error", mr.m.Name, strings.Join(args, ", "))
+	args := []string{
+		"context.Context",
+		"*meta.Key",
 	}
-	return fmt.Sprintf("%v(%v) (*%v.%v, error)", mr.m.Name, strings.Join(args, ", "), mr.Version(), mr.ReturnType)
+	args = mr.args(mr.argsSkip(), false, args)
+	if mr.kind == MethodPaged {
+		args = append(args, "*filter.F")
+	}
+
+	switch mr.kind {
+	case MethodOperation:
+		return fmt.Sprintf("%v(%v) error", mr.m.Name, strings.Join(args, ", "))
+	case MethodGet:
+		return fmt.Sprintf("%v(%v) (*%v.%v, error)", mr.m.Name, strings.Join(args, ", "), mr.Version(), mr.ReturnType)
+	case MethodPaged:
+		return fmt.Sprintf("%v(%v) ([]*%v.%v, error)", mr.m.Name, strings.Join(args, ", "), mr.Version(), mr.ItemType)
+	default:
+		panic(fmt.Errorf("invalid method kind: %v", mr.kind))
+	}
 }
