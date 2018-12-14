@@ -124,6 +124,11 @@
 			"Rev": "76bb4ee9f0ab50f77826f2a2ee7fb9d3880d6ec2"
 		},
 		{
+			"ImportPath": "github.com/GoogleCloudPlatform/k8s-cloud-provider",
+			"Comment": "1.2.0",
+			"Rev": "773c7a284e1399960745d0e2c501f577a20d4947"
+		},
+		{
 			"ImportPath": "github.com/MakeNowJust/heredoc",
 			"Rev": "bb23615498cded5e105af4ce27de75b089cbe851"
 		},
