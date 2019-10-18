@@ -33,6 +33,10 @@ import (
 //
 // https://www.kernel.org/doc/Documentation/networking/nf_conntrack-sysctl.txt
 type Conntracker interface {
+	// GetMax gets the current value of nf_conntrack_max (see
+	// https://www.kernel.org/doc/Documentation/networking/nf_conntrack-sysctl.txt
+	// for details).
+	GetMax() (int, error)
 	// SetMax adjusts nf_conntrack_max.
 	SetMax(max int) error
 	// SetTCPEstablishedTimeout adjusts nf_conntrack_tcp_timeout_established.
@@ -44,6 +48,10 @@ type Conntracker interface {
 type realConntracker struct{}
 
 var errReadOnlySysFS = errors.New("readOnlySysFS")
+
+func (rct realConntracker) GetMax() (int, error) {
+	return sysctl.New().GetSysctl("net/netfilter/nf_conntrack_max")
+}
 
 func (rct realConntracker) SetMax(max int) error {
 	if err := rct.setIntSysCtl("nf_conntrack_max", max); err != nil {

@@ -24,7 +24,6 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
-	goruntime "runtime"
 	"strings"
 	"time"
 
@@ -620,46 +619,7 @@ func (s *ProxyServer) Run() error {
 		}, 5*time.Second, wait.NeverStop)
 	}
 
-	// Tune conntrack, if requested
-	// Conntracker is always nil for windows
-	if s.Conntracker != nil {
-		max, err := getConntrackMax(s.ConntrackConfiguration)
-		if err != nil {
-			return err
-		}
-		if max > 0 {
-			err := s.Conntracker.SetMax(max)
-			if err != nil {
-				if err != errReadOnlySysFS {
-					return err
-				}
-				// errReadOnlySysFS is caused by a known docker issue (https://github.com/docker/docker/issues/24000),
-				// the only remediation we know is to restart the docker daemon.
-				// Here we'll send an node event with specific reason and message, the
-				// administrator should decide whether and how to handle this issue,
-				// whether to drain the node and restart docker.  Occurs in other container runtimes
-				// as well.
-				// TODO(random-liu): Remove this when the docker bug is fixed.
-				const message = "CRI error: /sys is read-only: " +
-					"cannot modify conntrack limits, problems may arise later (If running Docker, see docker issue #24000)"
-				s.Recorder.Eventf(s.NodeRef, api.EventTypeWarning, err.Error(), message)
-			}
-		}
-
-		if s.ConntrackConfiguration.TCPEstablishedTimeout != nil && s.ConntrackConfiguration.TCPEstablishedTimeout.Duration > 0 {
-			timeout := int(s.ConntrackConfiguration.TCPEstablishedTimeout.Duration / time.Second)
-			if err := s.Conntracker.SetTCPEstablishedTimeout(timeout); err != nil {
-				return err
-			}
-		}
-
-		if s.ConntrackConfiguration.TCPCloseWaitTimeout != nil && s.ConntrackConfiguration.TCPCloseWaitTimeout.Duration > 0 {
-			timeout := int(s.ConntrackConfiguration.TCPCloseWaitTimeout.Duration / time.Second)
-			if err := s.Conntracker.SetTCPCloseWaitTimeout(timeout); err != nil {
-				return err
-			}
-		}
-	}
+	s.maybeUpdateConntrack()
 
 	noProxyName, err := labels.NewRequirement(apis.LabelServiceProxyName, selection.DoesNotExist, nil)
 	if err != nil {
@@ -729,7 +689,38 @@ func (s *ProxyServer) birthCry() {
 	s.Recorder.Eventf(s.NodeRef, api.EventTypeNormal, "Starting", "Starting kube-proxy.")
 }
 
-func getConntrackMax(config kubeproxyconfig.KubeProxyConntrackConfiguration) (int, error) {
+func (s *ProxyServer) maybeUpdateConntrack() error {
+	if s.Conntracker == nil {
+		return nil
+	}
+
+	if err := maybeUpdateConntrackMax(s.Conntracker, &s.ConntrackConfiguration); err != nil {
+		switch err {
+		case errReadOnlySysFS:
+			// errReadOnlySysFS is caused by a known docker issue
+			// (https://github.com/docker/docker/issues/24000), the only
+			// remediation we know is to restart the docker daemon.  Here
+			// we'll send an node event with specific reason and message,
+			// the administrator should decide whether and how to handle
+			// this issue, whether to drain the node and restart docker.
+			// Occurs in other container runtimes as well.
+			//
+			// TODO(random-liu): Remove this when the docker bug is fixed.
+			const message = "CRI error: /sys is read-only: cannot modify conntrack limits, problems may arise later (If running Docker, see docker issue #24000)"
+			s.Recorder.Eventf(s.NodeRef, api.EventTypeWarning, err.Error(), message)
+		case nil:
+		default:
+			return err
+		}
+	}
+	if err := maybeUpdateConntrackTimeouts(s.Conntracker, &s.ConntrackConfiguration); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func getConnTrackMax(config kubeproxyconfig.KubeProxyConntrackConfiguration) (int, error) {
 	if config.MaxPerCore != nil && *config.MaxPerCore > 0 {
 		floor := 0
 		if config.Min != nil {
@@ -737,13 +728,48 @@ func getConntrackMax(config kubeproxyconfig.KubeProxyConntrackConfiguration) (in
 		}
 		scaled := int(*config.MaxPerCore) * goruntime.NumCPU()
 		if scaled > floor {
-			klog.V(3).Infof("getConntrackMax: using scaled conntrack-max-per-core")
+			klog.v(3).infof("getconntrackmax: using scaled conntrack-max-per-core")
 			return scaled, nil
 		}
-		klog.V(3).Infof("getConntrackMax: using conntrack-min")
+		klog.v(3).infof("getconntrackmax: using conntrack-min")
 		return floor, nil
 	}
 	return 0, nil
+}
+
+func maybeUpdateConntrackMax(ct Conntracker, cfg *kubeproxyconfig.KubeProxyConntrackConfiguration) error {
+	max, err := getconntrackmax(*cfg)
+	if err != nil || max <= 0 {
+		return err
+	}
+
+	curmax, err := ct.getmax()
+	if err == nil {
+		if curMax >= max {
+			klog.V(2).Infof("Conntrack max does not need adjustment (curMax = %d, want %d)", curMax, max)
+			return nil
+		}
+	} else {
+		klog.Errorf("Error getting conntrack max: %v", err)
+	}
+	klog.V(2).Infof("Updating conntrack max to %d", max)
+	return ct.SetMax(max)
+}
+
+func maybeUpdateConntrackTimeouts(ct Conntracker, cfg *kubeproxyconfig.KubeProxyConntrackConfiguration) error {
+	if cfg.TCPEstablishedTimeout != nil && cfg.TCPEstablishedTimeout.Duration > 0 {
+		timeout := int(cfg.TCPEstablishedTimeout.Duration / time.Second)
+		if err := ct.SetTCPEstablishedTimeout(timeout); err != nil {
+			return err
+		}
+	}
+	if cfg.TCPCloseWaitTimeout != nil && cfg.TCPCloseWaitTimeout.Duration > 0 {
+		timeout := int(cfg.TCPCloseWaitTimeout.Duration / time.Second)
+		if err := ct.SetTCPCloseWaitTimeout(timeout); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // CleanupAndExit remove iptables rules and exit if success return nil
